@@ -1,0 +1,755 @@
+---
+title: "EOCRC vs AOCRC Microbiome Project"
+author: "david.hein@utsouthwestern.edu"
+date: "`r Sys.Date()`"
+output: 
+  github_document:
+    toc: true
+    number_sections: true
+---
+
+
+# Libraries & Setup
+```{r,results='hide',message=FALSE, warning=FALSE}
+library(phyloseq)
+library(LinDA)
+library(Maaslin2)
+library(vegan)
+library(plyr)
+library(microbiomeMarker)
+library(ggpubr)
+library(tidyverse)
+library(ggtext)
+library(ggtext)
+library(ConQuR)
+library(doParallel) 
+library(microbiome)
+library(broom)
+library(scales)
+library(table1)
+
+source("helper_functions.r",local=knitr::knit_global())
+```
+
+
+
+# Clean patient data and build phylo object w/ ASV table
+```{r}
+# read in ASV table
+Sanford_Aug_2023level_7_ASVs <- read.csv("Sanford_Aug_2023level_7_ASVs.csv")
+
+# read in data and manually set factor levels
+pat_data <- read_delim("pat_data.txt", 
+                       delim = "\t", 
+                       escape_double = FALSE, 
+                       col_types = cols(batch = col_factor(levels = c("1","2", "3", "4", "5")), 
+                                        anti_class = col_factor(levels = c("none","ancef1", "ancef2", "other1", "other2")),
+                                        onset = col_factor(levels = c("EOCRC","AOCRC")), 
+                                        treatment_perscribed = col_factor(levels = c("chemo_short", "chemo_long", "other","std")), 
+                                        race_eth = col_factor(levels = c("White","Asian", "Black", "Hispanic")), 
+                                        ethnicity = col_factor(levels = c("nonhisp", "hisp")), 
+                                        n_stage = col_factor(levels = c("n0","n1", "n2")), 
+                                        t_simple = col_factor(levels = c("3ab","3cd", "4"))), 
+                       trim_ws = TRUE)
+
+# make this zero or 1 for logistic regression
+pat_d <- pat_data %>% mutate(resp3=ifelse(resp_simple=="c",1,0))
+
+# make a less specific antibiotics var
+pat_d2 <- pat_d %>% 
+  mutate(new_anti = ifelse(anti_class %in% c("other1","other2"),"strong","weakornone")) %>%
+  mutate(new_anti=ifelse(anti_class=="ancef1","ancef",new_anti))
+
+
+pat_d3 <- pat_d2 %>% mutate(new_anti = factor(new_anti, levels=c("weakornone","ancef","strong")))
+# normalize continous variables
+pat_d4 <- pat_d3 %>% mutate(age_at_diag2 = scale(age_at_diag), 
+                            bmi2 = scale(bmi), 
+                            treat_start2  = scale(treat_start), 
+                            TMB2 = ifelse(is.na(TMB),3.45,TMB ))
+
+pat_d5 <- pat_d4 %>% mutate(tmb3 = scale(TMB2))
+pat_d6 <- pat_d5 %>% mutate(newt = ifelse(str_detect(t_simple,"4"),"t4","t3"))
+
+samp_ids <- colnames(Sanford_Aug_2023level_7_ASVs)[8:71]
+
+pat_d6_ordered <- pat_d6[match(samp_ids, pat_d6$SampleID),]
+
+# build phylo obj, see helper funcs
+pat_d6_ordered <- pat_d6_ordered %>% mutate(batch = factor(batch, ordered = FALSE)) 
+phy_obj <- build_phylo_obj(pat_d6_ordered, Sanford_Aug_2023level_7_ASVs)
+
+
+```
+
+
+
+# Logistic Regressions for response
+```{r}
+
+single_var_log_res <- list()
+
+single_var_log_res[["sex_log"]]<-tidy(glm(resp3~sex,data=pat_d6,family="binomial"),conf.int=TRUE)%>%
+          mutate(estimate=exp(estimate), conf.low=exp(conf.low), conf.high=exp(conf.high))
+
+single_var_log_res[["age_cont_log"]]<-tidy(glm(resp3~age_at_diag2,data=pat_d6,family="binomial"),conf.int=TRUE)%>%
+          mutate(estimate=exp(estimate), conf.low=exp(conf.low), conf.high=exp(conf.high))
+
+single_var_log_res[["bmi_log"]]<-tidy(glm(resp3~bmi2,data=pat_d6,family="binomial"),conf.int=TRUE)%>%
+          mutate(estimate=exp(estimate), conf.low=exp(conf.low), conf.high=exp(conf.high))
+
+single_var_log_res[["new_anti_log"]]<-tidy(glm(resp3~new_anti,data=pat_d6,family="binomial"),conf.int=TRUE)%>%
+          mutate(estimate=exp(estimate), conf.low=exp(conf.low), conf.high=exp(conf.high))
+
+single_var_log_res[["t_simple_log"]]<-tidy(glm(resp3~t_simple,data=pat_d6,family="binomial"),conf.int=TRUE)%>%
+          mutate(estimate=exp(estimate), conf.low=exp(conf.low), conf.high=exp(conf.high))### strong signal with significant p values
+
+single_var_log_res[["batch_log"]]<-tidy(glm(resp3~batch,data=pat_d6_ordered,family="binomial"),conf.int=TRUE)%>%
+          mutate(estimate=exp(estimate), conf.low=exp(conf.low), conf.high=exp(conf.high))# 0.135, 0.185 pretty good actually
+
+single_var_log_res[["race_eth_log"]]<-tidy(glm(resp3~race_eth,data=pat_d6_ordered,family="binomial"),conf.int=TRUE)%>%
+          mutate(estimate=exp(estimate), conf.low=exp(conf.low), conf.high=exp(conf.high))
+
+single_var_log_res[["eth_log"]]<-tidy(glm(resp3~ethnicity,data=pat_d6_ordered,family="binomial"),conf.int=TRUE)%>%
+          mutate(estimate=exp(estimate), conf.low=exp(conf.low), conf.high=exp(conf.high))
+
+single_var_log_res[["onset_log"]]<-tidy(glm(resp3~onset,data=pat_d6_ordered,family="binomial"),conf.int=TRUE)%>%
+          mutate(estimate=exp(estimate), conf.low=exp(conf.low), conf.high=exp(conf.high))
+
+single_var_log_res[["facility_log"]]<-tidy(glm(resp3~facility,data=pat_d6_ordered,family="binomial"),conf.int=TRUE)%>%
+          mutate(estimate=exp(estimate), conf.low=exp(conf.low), conf.high=exp(conf.high))# actually quite high 0.105
+
+single_var_log_res[["n_stage_log"]] <-tidy(glm(resp3~n_stage,data=pat_d6_ordered,family="binomial"),conf.int=TRUE)%>%
+          mutate(estimate=exp(estimate), conf.low=exp(conf.low), conf.high=exp(conf.high))
+
+single_var_log_res[["treat_log"]]<-tidy(glm(resp3~treatment_perscribed,data=pat_d6_ordered,family="binomial"),conf.int=TRUE)%>%
+          mutate(estimate=exp(estimate), conf.low=exp(conf.low), conf.high=exp(conf.high))
+
+# Check out multivar of most important 
+summary(glm(resp3~t_simple+facility+batch,data=pat_d6,family=binomial(link="logit"))) # Facility most importnat
+
+# combine single vars
+combined_log <- do.call(rbind,single_var_log_res)
+combined_log <- combined_log %>% mutate_if(is.numeric,function(x) round(x,digits=2)) %>% filter(term!="(Intercept)")
+
+
+
+## Wilcox tests for BMI and age of diagnosis ##
+#summary(table(pat_d6_ordered$response,pat_d6_ordered$))
+
+hw<-pat_d6_ordered%>%filter(ethnicity=="hisp")
+hw<-hw$age_at_diag
+nhw<-pat_d6_ordered%>%filter(ethnicity=="nonhisp")
+nhw<-nhw$age_at_diag
+wilcox.test(hw,nhw)
+?wilcox.test
+median(nhw)
+median(hw)
+
+
+ao<-pat_d6_ordered%>%filter(ethnicity=="hisp")
+ao<-ao$
+eo<-pat_d6_ordered%>%filter(ethnicity=="nonhisp")
+eo<-eo$bmi
+wilcox.test(hw,nhw)
+?wilcox.test
+median(nhw)
+median(hw)
+
+fisher.test(table(pat_d6_ordered$sex,pat_d6_ordered$response))
+
+pvalue <- function(x, ...) {
+    # Construct vectors of data y, and groups (strata) g
+    y <- unlist(x)
+    g <- factor(rep(1:length(x), times=sapply(x, length)))
+    if (is.numeric(y)) {
+        # For numeric variables, perform a standard 2-sample t-test
+        p <- wilcox.test(y ~ g)$p.value
+    } else {
+        # For categorical variables, perform a chi-squared test of independence
+        p <- fisher.test(table(y, g))$p.value
+    }
+    # Format the p-value, using an HTML entity for the less-than sign.
+    # The initial empty string places the output on the line below the variable label.
+    c("", sub("<", "&lt;", format.pval(p, digits=3, eps=0.001)))
+}
+
+colnames(pat_d6_ordered)
+table1(~ sex + race_eth + onset + age_at_diag + bmi +facility+ intital_tnm + t_simple + n_stage + treatment_perscribed +new_anti + resp_why |`response`, data = pat_d6_ordered,overall=F, extra.col=list(`P-value`=pvalue))
+
+table1(~ sex + race_eth + onset + age_at_diag + bmi +facility+ t_simple + n_stage + treatment_perscribed +new_anti + resp_why |`response`, data = pat_d6_ordered)
+
+table1(~ sex + race_eth + onset + age_at_diag + bmi +facility+ t_simple + n_stage + treatment_perscribed +new_anti + resp_why, data = pat_d6_ordered)
+
+?fisher.test()
+```
+
+
+
+## Differential abundance tests
+```{r}
+# new_anti
+anti_classbac2 <- run_linda_all_levels(phy_obj$unfilt,"new_anti")
+mas_anti2 <- run_mas_all_levels(phy_obj$unfilt,"new_anti")
+combined_anti2<-combine_res_mas_lind(mas_anti2, anti_classbac2)
+
+# Batch
+linda_batch <- run_linda_all_levels_no_batch_anti(phy_obj$filt,"batch")
+
+
+# controlled for anti response
+resp_anti_lind <- run_linda_all_levels_anti(phy_obj$unfilt,"resp3")
+resp_anti_mas <- run_mas_all_levels_anti(phy_obj$unfilt, "resp3")
+combined_anti_resp <- combine_res_mas_lind(resp_anti_mas, resp_anti_lind)
+
+
+# controlled for anti t stage
+t_anti_lind <- run_linda_all_levels_anti(phy_obj$unfilt,"t_simple")
+t_anti_mas <- run_mas_all_levels_anti(phy_obj$unfilt, "t_simple")
+combined_anti_t <- combine_res_mas_lind(t_anti_mas, t_anti_lind)
+
+
+# controlled for anti eth
+eth_anti_lind <- run_linda_all_levels_anti(phy_obj$unfilt,"ethnicity")
+eth_anti_mas <- run_mas_all_levels_anti(phy_obj$unfilt, "ethnicity")
+combined_anti_eth <- combine_res_mas_lind(eth_anti_mas, eth_anti_lind)
+
+
+# controlled for anti age at diag
+age_anti_lind <- run_linda_all_levels_anti(phy_obj$unfilt,"age_at_diag2")
+age_anti_mas <- run_mas_all_levels_anti(phy_obj$unfilt, "age_at_diag2")
+combined_anti_age <- combine_res_mas_lind(age_anti_mas, age_anti_lind)
+
+
+# controlled for anti onset
+onset_anti_lind <- run_linda_all_levels_anti(phy_obj$unfilt,"onset")
+onset_anti_mas <- run_mas_all_levels_anti(phy_obj$unfilt, "onset")
+combined_anti_onset <- combine_res_mas_lind(onset_anti_mas, onset_anti_lind)
+
+
+## BIG control for response
+resp_anti_lind2 <- run_linda_all_levels_anti(phy_obj$unfilt,"resp3+facility+t_simple")
+## THIS WILL REWUIRE ADDING IN FACILITY AND T SIMPLE TO THE MAASLIN CODE IN HELPER FUNCS
+resp_anti_mas2 <- run_mas_all_levels_anti(phy_obj$unfilt, "resp3")
+combined_anti_resp2 <- combine_res_mas_lind(resp_anti_mas2, resp_anti_lind2)
+
+```
+
+
+
+# Figure 1 Differential expression Plot 
+```{r, warning=FALSE}
+# Now the stylized taxa names are edited manually in excel and then imported back into R
+  # Used to make the final table used for the figure in R, but it required a TON of code, much more practical to just add the needed edits in excel
+styled_taxa_figure_3 <- read_csv("styled_taxa_DA_fig.csv", trim_ws = FALSE)
+
+# Multiply by -1 here because the ref group got switched 
+graph_df_with_stylized_taxa <- styled_taxa_figure_3 %>% select(styled_taxa, 
+                                                               `Log FC MaAsLin2`,
+                                                               `Log FC LinDA`,
+                                                               sdmas,
+                                                               sdlind,
+                                                               couchy_p_adjusted) %>% mutate(`Log FC MaAsLin2`=-1*`Log FC MaAsLin2`) %>%  
+                                                                                      mutate(`Log FC LinDA`=-1*`Log FC LinDA`) 
+
+# pivot so that each line in the dataframe is its own bar in the figure
+graph_df_final <- graph_df_with_stylized_taxa %>% pivot_longer(cols = 2:3, names_to = "fc_type", values_to = "Log FC" )
+graph_df_final <- graph_df_final %>% pivot_longer(cols = 2:3, names_to = "se_type", values_to = "Standard Error" )
+
+# filter out incorrect matches of LFC and SE
+graph_df_final <- graph_df_final%>%filter( !(str_detect(se_type,"sdmas") & str_detect(fc_type,"LinDA")) )
+graph_df_final <- graph_df_final%>%filter( !(str_detect(se_type,"sdlin") & str_detect(fc_type,"MaA")) )
+
+# add in decrease or increase for fill color
+graph_df_final <- graph_df_final %>% mutate(fc_type = ifelse(`Log FC` < 0, paste0(fc_type,"decrease"), paste0(fc_type,'increase')))
+
+# Order by linda fold change
+graph_df_final$fc_type = factor(graph_df_final$fc_type,levels = c("Log FC MaAsLin2decrease","Log FC LinDAdecrease","Log FC MaAsLin2increase","Log FC LinDAincrease"))
+subset_re <- graph_df_final%>%dplyr::filter(se_type=="sdlind")
+subset_re$styled_taxa = with(subset_re,reorder(styled_taxa,`Log FC`))
+graph_df_final$styled_taxa = factor(graph_df_final$styled_taxa,levels = levels(subset_re$styled_taxa))
+
+ggplot(graph_df_final,aes(fill=fc_type,y=`Log FC`,x=styled_taxa))+
+          geom_bar(width=0.7,position=position_dodge(0.7),stat="identity")+
+          geom_errorbar(aes(ymin=`Log FC`,ymax=ifelse(`Log FC`>0,`Log FC`+2*`Standard Error`,`Log FC`-2*`Standard Error`)),
+                        width=0.30,position = position_dodge(0.7),color="#525252",linewidth=0.30)+
+          coord_flip()+   
+          scale_fill_manual(values=c("#f4a582","#d6604d","#92c5de","#4393c3"))+
+          theme_bw()+
+          theme( # remove the vertical grid lines
+           panel.grid.major.x = element_blank(),
+           panel.grid.minor.x = element_blank(),
+           # explicitly set the horizontal lines (or they will disappear too)
+           panel.grid.major.y = element_line( size=.05, color="black"), legend.position = 'none', legend.title = element_blank(),
+           axis.text.y = element_markdown(colour = 'black'),
+           axis.title.y = element_blank(),
+           text=element_text(size=24,color="black"),
+           axis.title.x = element_text(size=24,color="black"),
+           axis.text.x = element_text(size = 20,color="black"))+
+          guides(fill=guide_legend(nrow=2,byrow=TRUE))+
+          ylab( bquote(Fold~change~(log[2]))  )+
+          scale_y_continuous(breaks=c(-8,-7,-6,-5,-4,-3,-2,-1,0,1,2,3,4,5,6,7,8), labels = c("8","","6","","4","","2","","0","","2","","4","","6","","8"), limits=c(-8,8.5))
+
+ggsave(plot=last_plot(),file="DAfig.jpeg",width = 12, height=13)
+
+```
+<br><br>
+
+## Make a batch corrected matrix for Beta Diversity
+```{r}
+# Start with the old out table
+asv <- as.data.frame(phy_obj$filt@otu_table)
+patient_table <- as.data.frame(phy_obj$filt@sam_data)
+asv_t <- t(asv)
+
+samp_ids <- row.names(asv_t)
+pat_d6_ordered <- pat_d6[match(samp_ids, pat_d6$SampleID),]
+
+pat_d6_ordered <- pat_d6_ordered %>% mutate(batch = factor(batch, ordered = FALSE)) #%>%
+# mutate(batch=ifelse(batch=="5","4",batch))
+pat_d6_ordered <- pat_d6_ordered %>% mutate(response = ifelse(resp3=="0","p","c"))
+
+batch_ids <-  factor(pat_d6_ordered$batch)
+#row.names(batch_ids) <- pat_d6_ordered$SampleID
+
+# select covars for batch correction algo
+covars <- pat_d6_ordered %>% select('facility','onset','resp3','ethnicity','new_anti')
+
+covars <- covars %>% mutate(facility = factor(facility, levels=c("UTSW","Parkland"))) 
+covars <- covars %>% mutate(resp3 = factor(resp3, levels=c("0","1"))) 
+covars2 <- covars %>% mutate(
+  resp3 = factor(resp3, ordered = FALSE),
+  facility = factor(facility, ordered = FALSE),
+  ethnicity = factor(ethnicity, ordered = FALSE),
+  onset = factor(onset, ordered = FALSE),
+  new_anti = factor(new_anti, ordered = FALSE)
+)
+
+
+# Perform correction
+set.seed(2023)
+corrected_asv_las_all2 <- ConQuR_libsize(tax_tab = asv_t, batchid = batch_ids, covariates = covars2, batch_ref = "2",logistic_lasso = T, quantile_type = 'lasso', interplt=T, num_core = 4)
+
+# Make new phylo object
+asv_final <- t(corrected_asv_las_all2)
+
+otu<-otu_table(asv_final,taxa_are_rows =TRUE)
+
+clin <- pat_d6_ordered%>%dplyr::select(-SampleID)
+row.names(clin)<-pat_d6_ordered$SampleID
+samples<-sample_data(clin)
+sample_names(samples) <- pat_d6_ordered$SampleID
+
+taxa_names <- as.data.frame(row.names(asv_final))
+taxa_df <- taxa_names %>% separate(`row.names(asv_final)` , c("Kingdom","Phylum","Class","Order","Family","Genus","Species"), sep = ";")
+row.names(taxa_df) <- taxa_names[,1]
+taxa_mt <- as.matrix(taxa_df)
+
+tax<-tax_table(taxa_mt)
+obj<-phyloseq(otu,samples,tax)
+
+phy_batch_corr <- obj
+```
+
+
+## Beta diversity (Eth/Onset)
+```{r}
+
+# transform/normalize counts
+otus.rel <- microbiome::transform(phy_batch_corr, method="compositional") 
+otus.rel2 <- abundances(otus.rel)
+# calc distance
+dist_bray<-vegdist(t(otus.rel2),method="bray")
+
+otus.clr <- microbiome::transform(phy_batch_corr, method="clr") 
+otus.clr2 <- abundances(otus.clr)
+# calc distance
+dist_atch <- vegdist(t(otus.clr2),method="robust.aitchison")
+
+# perform pcoa on the distance matrix
+pcoa_bray <- ape::pcoa(dist_bray, correction = "cailliez")
+pcoa_atch <- ape::pcoa(dist_atch)
+
+# get vectors for plotting
+bray_axis <- data.frame(pcoa_bray$vectors[,c(1,2)])
+atch_axis <- data.frame(pcoa_atch$vectors[,c(1,2)])
+
+bray_axis$SampleID <- row.names(bray_axis)
+atch_axis$SampleID <- row.names(atch_axis)
+
+pat_with_coords <- inner_join(bray_axis,pat_d6_ordered)
+pat_with_coords$pc1_bray <- pat_with_coords$Axis.1
+pat_with_coords$pc2_bray <- pat_with_coords$Axis.2
+pat_with_coords <- inner_join(atch_axis,pat_with_coords, by = "SampleID")
+pat_with_coords$pc1_ach <- pat_with_coords$Axis.1.x
+pat_with_coords$pc2_ach <- pat_with_coords$Axis.2.x
+
+
+# get percentages of variance
+ach_pc1 <- pcoa_atch$values$Relative_eig[1] / sum(pcoa_atch$values$Relative_eig)
+ach_pc2 <- pcoa_atch$values$Relative_eig[2] / sum(pcoa_atch$values$Relative_eig)
+
+bray_pc1 <- pcoa_bray$values$Rel_corr_eig[1] / sum(pcoa_bray$values$Rel_corr_eig)
+bray_pc2 <- pcoa_bray$values$Rel_corr_eig[2] / sum(pcoa_bray$values$Rel_corr_eig)
+
+
+# Ethnicity
+ea<-ggplot(pat_with_coords, aes(x = `Axis.1.x`, y=`Axis.2.x`,color = ethnicity)) + 
+  geom_point(size=2.8) +
+  stat_ellipse(linetype=2,linewidth=0.8) + 
+  ggtitle("B") + 
+  theme_test() +
+  theme(legend.position = "none",
+        text = element_text(size=20),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  annotate("text", x=8.8, y=11, 
+           label="PERMANOVA Results:\nseparation p<0.001\nR^2=0.029\ndispersion p=0.463",
+           size=4, lineheight=0.8) +
+  xlim(-11,13.5) +
+  ylim(-12,12.5) +
+  coord_fixed(ach_pc2/ach_pc1) + 
+  scale_color_manual(values=c("#d6604d","#4393c3"),labels=c("Non Hispanic","White Hispanic")) + 
+  #xlab(paste0("PC1 (",round(100*pcoa_atch$values$Relative_eig[1],1),"%)")) + 
+  #ylab(paste0("PC1 (",round(100*pcoa_atch$values$Relative_eig[2],1),"%)")) +
+  labs(color = "Ethnicity:")
+
+eb<-ggplot(pat_with_coords,aes(x=`Axis.1.y`,y=`Axis.2.y`,color=ethnicity)) + 
+  geom_point(size=2.8) +
+  stat_ellipse(linetype=2,linewidth=0.8) + 
+  ggtitle("A") +
+  theme_test() +
+  theme(legend.position = "none",
+        text = element_text(size=20),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  annotate("text",x=-.52, y=.42, 
+           label="PERMANOVA Results:\nseparation p<0.001\nR^2=0.042\ndispersion p=0.894",
+           size=4,lineheight=0.8) +
+  coord_fixed(bray_pc2/bray_pc1) + 
+  xlim(-.66,.54) +
+  ylim(-.52,.52) +
+  scale_color_manual(values=c("#d6604d","#4393c3"),labels=c("Non Hispanic","White Hispanic")) + 
+  #xlab(paste0("PC1 (",round(100*pcoa_bray$values$Rel_corr_eig[1],1),"%)")) + 
+  #ylab(paste0("PC1 (",round(100*pcoa_bray$values$Rel_corr_eig[2],1),"%)")) +
+  labs(color = "Ethnicity:")
+
+
+
+# Onset
+oa<-ggplot(pat_with_coords,aes(x=`Axis.1.x`,y=`Axis.2.x`,color=onset)) + 
+  geom_point(size=2.8) +
+  stat_ellipse(linetype=2,linewidth=0.8) + 
+  ggtitle("D") +
+  theme_test() +
+  theme(legend.position = "none",
+        text = element_text(size=20),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  annotate("text",  x=8.8, y=11, 
+           label="PERMANOVA Results:\nseparation p=0.022\nR^2=0.022\ndispersion p=0.548",
+           size=4,lineheight=0.8) +
+  xlim(-11,13.5) +
+  ylim(-12,12.5) +
+  coord_fixed(ach_pc2/ach_pc1) + 
+  scale_color_manual(values=c("#bf812d","#35978f"),labels=c("EOCRC","AOCRC")) + 
+  #xlab(paste0("PC1 (",round(100*pcoa_atch$values$Relative_eig[1],1),"%)")) + 
+  #ylab(paste0("PC1 (",round(100*pcoa_atch$values$Relative_eig[2],1),"%)"))+
+  labs(color = "Onset Category:")
+
+ob<-ggplot(pat_with_coords,aes(x=`Axis.1.y`,y=`Axis.2.y`,color=onset)) + 
+  geom_point(size=2.8) +
+  stat_ellipse(linetype=2,linewidth=0.8) + 
+  ggtitle("C") +
+  theme_test() +
+  theme(legend.position = "none",
+        text = element_text(size=20),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  annotate("text", x=-.52, y=.42, 
+           label="PERMANOVA Results:\nseparation p=0.035\nR^2=0.025\ndispersion p=0.383",
+           size=4,lineheight=0.8) +
+  coord_fixed(bray_pc2/bray_pc1) + 
+  xlim(-.66,.54) +
+  ylim(-.52,.52) +
+  scale_color_manual(values=c("#bf812d","#35978f"),labels=c("EOCRC","AOCRC")) + 
+  #xlab(paste0("PC1 (",round(100*pcoa_bray$values$Rel_corr_eig[1],1),"%)")) + 
+  #ylab(paste0("PC1 (",round(100*pcoa_bray$values$Rel_corr_eig[2],1),"%)")) +
+  labs(color = "Onset Category:")
+  
+# Permutation tests ethnicity
+set.seed(2023)
+vegan::adonis2( t(otus.clr2) ~ ethnicity, data=pat_d6_ordered, permutations=100000, method="robust.aitchison")
+
+set.seed(2023)
+permutest(betadisper(dist_atch,pat_d6_ordered$ethnicity), permutations = 100000)
+
+set.seed(2023)
+vegan::adonis2( t(otus.rel2) ~ ethnicity, data=pat_d6_ordered, permutations=100000, method="bray")
+
+set.seed(2023)
+permutest(betadisper(dist_bray,pat_d6_ordered$ethnicity), permutations = 100000)
+
+
+# Permutation tests onset 
+set.seed(2023)
+vegan::adonis2( t(otus.clr2) ~ onset, data=pat_d6_ordered, permutations=100000, method="robust.aitchison")
+
+set.seed(2023)
+permutest(betadisper(dist_atch,pat_d6_ordered$onset), permutations = 100000)
+
+set.seed(2023)
+vegan::adonis2( t(otus.rel2) ~ onset, data=pat_d6_ordered, permutations=100000, method="bray")
+
+set.seed(2023)
+permutest(betadisper(dist_bray,pat_d6_ordered$onset), permutations = 100000)
+
+# Permutation tests response
+set.seed(2023)
+vegan::adonis2( t(otus.clr2) ~ response, data=pat_d6_ordered, permutations=100000, method="robust.aitchison")
+
+set.seed(2023)
+permutest(betadisper(dist_atch,pat_d6_ordered$response), permutations = 100000)
+
+set.seed(2023)
+vegan::adonis2( t(otus.rel2) ~ response, data=pat_d6_ordered, permutations=100000, method="bray")
+
+set.seed(2023)
+permutest(betadisper(dist_bray,pat_d6_ordered$response), permutations = 100000)
+
+
+
+# Response
+ra<-ggplot(pat_with_coords,aes(x=`Axis.1.x`,y=`Axis.2.x`,color=response)) + 
+  geom_point(size=2.8) +
+  stat_ellipse(linetype=2,linewidth=0.8) + 
+  ggtitle("F") +
+  theme_test() +
+  theme(legend.position = "none",
+        text = element_text(size=20),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  annotate("text", x=8.8, y=11, 
+           label="PERMANOVA Results:\nseparation p=0.111\nR^2=0.019\ndispersion p=0.385",
+           size=4,lineheight=0.8) +
+  xlim(-11,13.5) +
+  ylim(-12,12.5) +
+  coord_fixed(ach_pc2/ach_pc1) + 
+  scale_color_manual(values=c("#e08214","#8073ac"),labels=c("Complete/Near Complete","Partial/Poor")) + 
+  #xlab(paste0("PC1 (",round(100*pcoa_atch$values$Relative_eig[1],1),"%)")) + 
+  #ylab(paste0("PC1 (",round(100*pcoa_atch$values$Relative_eig[2],1),"%)")) +
+  labs(color = "Treatment Response:")
+
+rb<-ggplot(pat_with_coords, aes(x=`Axis.1.y`,y=`Axis.2.y`,color=response)) + 
+  geom_point(size=2.8) +
+  stat_ellipse(linetype=2,linewidth=0.8) + 
+  ggtitle("E") +
+  theme_test() +
+  theme(legend.position = "none",
+        text = element_text(size=20),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank())+
+  annotate("text", x=-.52, y=0.42, 
+           label="PERMANOVA Results:\nseparation p=0.071\nR^2=0.023\ndispersion p=0.213",
+           size=4,lineheight=0.8) +
+  coord_fixed(bray_pc2/bray_pc1) + 
+  xlim(-.66,.54) +
+  ylim(-.52,.52) +
+  scale_color_manual(values=c("#e08214","#8073ac"),labels=c("Complete/Near Complete","Partial/Poor")) + 
+  #xlab(paste0("PC1 (",round(100*pcoa_bray$values$Rel_corr_eig[1],1),"%)")) + 
+  #ylab(paste0("PC1 (",round(100*pcoa_bray$values$Rel_corr_eig[2],1),"%)")) +
+  labs(color = "Treatment Response:") 
+
+oa
+ea
+rb
+bray_pc2/bray_pc1
+ggarrange(eb,ea,ob,oa,rb,ra,nrow = 3,ncol=2 ,align = "v")
+ggsave(plot=last_plot(), file="beta_div2.jpeg",height=12,width=19.32)
+
+?ggarrange
+
+```
+
+
+## Alpha diversity
+```{r, message=FALSE, warning=FALSE}
+alpha_meas = c("Chao1", "Shannon", "Simpson")
+
+p1<-plot_richness(phy_obj$unfilt, "ethnicity", measures=alpha_meas) 
+p1b<-p1+geom_boxplot(data=p1$data, aes(x=ethnicity, y=value, color=ethnicity), alpha=0.1)+
+    stat_compare_means(method="wilcox.test",aes(label = ..p.format..),label.x.npc = "center",hjust=.5,vjust=.5) + 
+    ggtitle("A") + 
+    scale_x_discrete(labels=c("nonhisp" = "Non\nHispanic", "hisp" = "White\nHispanic" )) +
+    xlab("")+
+  theme_test() + 
+  theme(plot.title = element_text(size = 20))+
+    guides(x =  guide_axis(angle = 0)) + 
+    ylab("")+ 
+    scale_color_manual(values=c("#d6604d","#4393c3")) + 
+    theme(legend.position = "none")
+p1b
+
+p2<-plot_richness(phy_obj$unfilt, "onset", measures=alpha_meas) 
+p2b<-p2+
+  geom_boxplot(data=p2$data, aes(x=onset, y=value, color=onset), alpha=0.1)+
+    stat_compare_means(method="wilcox.test",aes(label = ..p.format..),label.x.npc = "center",hjust=.5,vjust=.5) + 
+    ggtitle("B") + 
+    theme_test() + 
+    xlab("")+ 
+    ylab("")+ 
+    theme(plot.title = element_text(size = 20))+
+    scale_color_manual(values=c("#bf812d","#35978f")) + 
+    theme(legend.position = "none")
+p2b
+
+p3<-plot_richness(phy_obj$unfilt, "response", measures=alpha_meas) 
+p3b<-p3+
+  geom_boxplot(data=p3$data, aes(x=response, y=value, color=response), alpha=0.1)+
+    ggtitle("C") + 
+    theme_test() +
+    stat_compare_means(method="wilcox.test",aes(label = ..p.format..),label.x.npc = "center",hjust=.5,vjust=.5) + 
+    scale_x_discrete(labels=c("p" = "Partial/Poor", "c" = "Complete/\nNear Complete" ),) + 
+    xlab("") + 
+    ylab("")+
+  theme(plot.title = element_text(size = 20))+
+    scale_color_manual(values=c("#e08214","#8073ac")) + 
+    theme(legend.position = "none")
+p3b
+
+ggarrange(p1b,p2b,p3b,ncol=1)
+ggsave(plot=last_plot(),filename = "alpha.jpeg",height=12,width=6)
+
+```
+
+
+```{r}
+
+counts_all <- Sanford_Aug_2023level_7_ASVs %>%filter(Kingdom !="Archaea")%>%filter(rowSums(across(where(is.numeric)))!=0)
+
+# add in signifier of taxa level
+counts_all2<-counts_all%>%mutate(Kingdom=paste0("d__",Kingdom),
+                                  Phylum=paste0("p__",Phylum),
+                                  Class=paste0("c__",Class),
+                                  Order=paste0("o__",Order),
+                                  Family=paste0("f__",Family),
+                                  Genus=paste0("g__",Genus),
+                                  Species=paste0("s__",Species))
+
+# add up the identical ASVs
+  # first make a taxonomy variable in a single column and remove the multiple columns
+counts_all_combinedASV <- counts_all2 %>% 
+    mutate(taxonomy = base::paste(Kingdom,Phylum,Class,Order,Family, sep=";")) %>% 
+    relocate(taxonomy)
+  
+counts_all_combinedASV2 <- counts_all_combinedASV %>% 
+    dplyr::select(-Kingdom,-Phylum,-Class,-Order,-Family,-Genus,-Species)
+  
+# use ddply to sum up the identical taxa
+counts_all_combinedASV3<-counts_all_combinedASV2 %>% ddply("taxonomy",numcolwise(sum))
+
+scale_col <- function(col){
+  col_sum <- sum(col)
+  col_scaled <- col/col_sum
+  return(round(col_scaled,7))
+}
+df_scaled <- counts_all_combinedASV3 %>% mutate( across(where(is.numeric), scale_col))
+
+
+df_graph_hist<- df_scaled%>%mutate(Grouping="Other Bacteria")%>%
+  mutate(
+  Grouping = case_when (str_detect(taxonomy,"p__Actinobacteriota") ~ "p_Actinobacteriota",
+  str_detect(taxonomy,"p__Bacteroidota")  & !str_detect(taxonomy, "f__Prevotellaceae")~ "p_Bacteroidota",
+  str_detect(taxonomy,"f__Prevotellaceae") ~ "f_Prevotellaceae",
+  str_detect(taxonomy, "p__Firmicutes")& !str_detect(taxonomy, "f__Ruminococcaceae") ~ "p_Firmicutes",
+  str_detect(taxonomy, "f__Lachnospiraceae") ~ "f_Lachnospiraceae",
+  str_detect(taxonomy, "f__Ruminococcaceae")~"f_Ruminococcaceae",
+  str_detect(taxonomy,"p__Proteobacteria") ~ "p_Proteobacteria"))%>%
+  mutate(Grouping=ifelse(is.na(Grouping),"Other Bacteria",Grouping))%>%
+  relocate(Grouping)
+
+
+df_graph_hist2<-df_graph_hist%>%select(-taxonomy)
+df_graph_hist2<-df_graph_hist2%>%ddply("Grouping",numcolwise(sum))
+blank_row <- c("Blank",rep(0,64))
+df_graph_hist3 <- rbind(df_graph_hist2,blank_row)
+d4 <- df_graph_hist3 %>% pivot_longer(!Grouping,names_to = "SampleID",values_to="Abundance") 
+
+row_t <- pat_d6_ordered %>% select(SampleID,ethnicity)
+t5 <- left_join(d4,row_t)
+
+
+
+blank_col <- data.frame( "p_Actinobacteriota" =c(0.0), "p_Bacteroidota"  =c(0.0),   "f_Prevotellaceae"  =c(0.0), "p_Firmicutes"    =c(0.0),   "f_Lachnospiraceae" =c(0.0), "f_Ruminococcaceae" =c(0.0), "p_Proteobacteria" =c(0.0), "Other Bacteria" =c(0.0),"Blank" = c(1.0), "ethnicity"  = c("nonhisp"), "SampleID" = c("z") )
+blank_long <- blank_col %>% pivot_longer(1:9, names_to = "Grouping", values_to = "Abundance") %>% relocate(Grouping,SampleID,Abundance,ethnicity)
+
+df_hist_final <- rbind(t5,blank_long) 
+df_hist_final <- df_hist_final %>% mutate(Abundance= as.numeric(Abundance))
+
+
+df_hist_final$Grouping <- factor(df_hist_final$Grouping,levels = c("p_Actinobacteriota" , "p_Bacteroidota", "f_Prevotellaceae", "p_Firmicutes" ,"f_Lachnospiraceae" ,"f_Ruminococcaceae", "p_Proteobacteria" ,"Other Bacteria","Blank"))
+
+levels(df_hist_final$Grouping)
+
+df_hist_final <- df_hist_final %>% mutate(SampleID = ifelse(ethnicity=="nonhisp",paste0("a",SampleID),paste0("b",SampleID)))
+
+df_hist5 <- df_hist5 %>% mutate(prop=prop*100)
+
+ggplot(df_hist_final,aes(fill=Grouping,y=Abundance,x=SampleID,alpha=Grouping)) + 
+  theme_classic()+
+  geom_bar(position="fill",stat="identity") +
+  
+  scale_fill_manual(values=c("#CE0665","#FFC800","#882255","#0d520d","#4a883f", "#82c273" ,"#A2B5FF","#FF8427","white"))+
+  scale_alpha_manual(values=c(.6,.6, 1,.6,.6,.6,.6,.6,.6))+
+  theme(axis.text.x = element_blank())+
+  xlab("")+ylab("Relative Abundance") +
+  scale_y_continuous(breaks=c(0,.25,0.5,0.75,1), labels = c("0","25","50","75","100"))+
+  coord_cartesian( ylim=c(0,1.01), expand = FALSE )+
+  theme(text = element_text(size=20) , legend.position = "none")
+
+ggplot(df_hist_final,aes(fill=Grouping,y=Abundance,x=SampleID,alpha=Grouping))+geom_bar(position="fill",stat="identity")
+ggsave(plot=last_plot(),file="hist_4_8.jpeg",height=4,width=8)
+```
+
+
+```{r}
+obj_fam <- aggregate_taxa(phy_obj$unfilt, "Family",verbose=TRUE)
+?aggregate_taxa
+
+df_fam <- data.frame(phy_obj$unfilt@otu_table)
+
+## FAMILY LEVEL
+# same as above but combines identical families
+df5s<-df4%>%mutate(taxonomy=base::paste(Kingdom,Phylum,Class,Order,Family, sep=";"))
+df6s<-df5s%>%relocate(taxonomy)%>%select(-Kingdom,-Phylum,-Class,-Order,-Family,-Genus,-Species)
+df7s<-df6s%>%ddply("taxonomy",numcolwise(sum))
+df8s<-df7s[,-1]
+rownames(df8s)<-df7s[,1]
+mat8s<-as.matrix(df8s)
+df9s<-sweep(mat8s, 2, colSums(mat8s), FUN="/")
+df10s<-scale(mat8s, center=FALSE, scale=colSums(mat8s))
+df10s<-data.frame(df10s)
+df10s$taxonomy<-rownames(df10s)
+df10s<-df10s%>%relocate(taxonomy)
+
+```
+
+
+
+# Session info
+```{r}
+sessionInfo()
+citation("phyloseq")
+```
